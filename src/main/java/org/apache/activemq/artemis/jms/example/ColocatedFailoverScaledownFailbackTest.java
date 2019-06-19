@@ -16,6 +16,12 @@
  */
 package org.apache.activemq.artemis.jms.example;
 
+import java.io.IOException;
+import java.util.Hashtable;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.function.BiPredicate;
 import javax.jms.Connection;
 import javax.jms.ConnectionFactory;
 import javax.jms.MessageConsumer;
@@ -23,11 +29,16 @@ import javax.jms.MessageProducer;
 import javax.jms.Queue;
 import javax.jms.Session;
 import javax.jms.TextMessage;
+import javax.management.JMX;
+import javax.management.MBeanServerConnection;
+import javax.management.ObjectName;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
 import javax.naming.InitialContext;
-import java.util.Hashtable;
-import java.util.UUID;
-
+import org.apache.activemq.artemis.api.core.management.ActiveMQServerControl;
 import org.apache.activemq.artemis.util.ServerUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A simple example that demonstrates server side load-balancing of messages between the queue instances on different
@@ -38,6 +49,8 @@ public class ColocatedFailoverScaledownFailbackTest {
    private static Process server0;
 
    private static Process server1;
+
+   static Logger log = LoggerFactory.getLogger(ColocatedFailoverScaledownFailbackTest.class);
 
    public static void main(final String[] args) throws Exception {
       final int numMessages = 30;
@@ -53,8 +66,11 @@ public class ColocatedFailoverScaledownFailbackTest {
          server1 = ServerUtil.startServer(args[1], ColocatedFailoverScaledownFailbackTest.class.getSimpleName() + "1", 1, 5000);
 
          System.out.println(args[0]);
+         System.out.println(args[1]);
 
-         Thread.sleep(15000);
+         Thread.sleep(15_000);
+
+         validateState((nodeIds0, nodeIds1) -> 2 == nodeIds0.size() && 2 == nodeIds1.size() && nodeIds0.containsAll(nodeIds1),"each server should have the same 2 nodeIds");
 
          // Step 1. Get an initial context for looking up JNDI for both servers
          Hashtable<String, Object> properties = new Hashtable<>();
@@ -101,6 +117,8 @@ public class ColocatedFailoverScaledownFailbackTest {
          System.out.println("Waiting for scale-down to complete...");
          Thread.sleep(10000);
 
+         validateState((nodeIds0, nodeIds1) -> 0 == nodeIds0.size() && 2 == nodeIds1.size(),"server0 should be dead, server1 should have 2 nodeIds");
+
          // Step 8. start the connection ready to receive messages
          connection1.start();
 
@@ -123,7 +141,12 @@ public class ColocatedFailoverScaledownFailbackTest {
          // Step 11. Start server #0 back up
          System.out.println("STARTING SERVER AGAIN");
          server0 = ServerUtil.startServer(args[0], ColocatedFailoverScaledownFailbackTest.class.getSimpleName() + "0", 0, 5000);
-         Thread.sleep(10000);
+         // give time to vote
+         Thread.sleep(20_000);
+
+         // sometimes we see server0 could not get a backup. sometimes we see server1 could not get a backup
+         // we would expect that the server could rejoin and both brokers could each have a backup
+         validateState((nodeIds0, nodeIds1) -> 2 == nodeIds0.size() && 2 == nodeIds1.size() && nodeIds0.containsAll(nodeIds1),"each server should have the same 2 nodeIds");
 
          //Step 12. Rebuild our connection to server #0
          connection = connectionFactory.createConnection();
@@ -181,5 +204,57 @@ public class ColocatedFailoverScaledownFailbackTest {
          ServerUtil.killServer(server0);
          ServerUtil.killServer(server1);
       }
+   }
+
+
+   private static SortedSet<String> obtainBrokerNodeIds(int i) throws Exception {
+
+      SortedSet<String> nodeIds = new TreeSet<>();
+
+      String label="broker"+i;
+      int port = 9010+i;
+      System.out.println("**********************************");
+
+      try {
+         MBeanServerConnection mbs = JMXConnectorFactory.connect(new JMXServiceURL("service:jmx:rmi:///jndi/rmi://127.0.0.1:"+port+"/jmxrmi")).getMBeanServerConnection();
+         Set<ObjectName> brokers = mbs.queryNames(new ObjectName("org.apache.activemq.artemis:broker=*"),null);
+         for (ObjectName broker : brokers) {
+            ActiveMQServerControl asc = JMX
+                .newMBeanProxy(mbs, new ObjectName(broker.getCanonicalName()),
+                    ActiveMQServerControl.class);
+            String brokerName = broker.getCanonicalKeyPropertyListString();
+            String nodeId = asc.getNodeID();
+            log.info("{} contains {} {} nodeId={} ", label, brokerName, brokerName.contains("colocated_backup")?"of":"with", nodeId);
+            nodeIds.add(nodeId);
+         }
+      } catch (IOException e) {
+         log.warn("connect exception: {}", e.getMessage());
+      }
+      System.out.println("**********************************");
+      return nodeIds;
+   }
+
+      private static void validateState(BiPredicate<SortedSet<String>, SortedSet<String>> test, String msg) throws Exception {
+         validateState(test,msg, true);
+      }
+
+      private static void validateState(BiPredicate<SortedSet<String>,SortedSet<String>> test, String msg, boolean fullExit) throws Exception {
+
+      System.out.println("**********************************");
+
+      SortedSet<String> nodeIds0 = obtainBrokerNodeIds(0);
+      SortedSet<String> nodeIds1 = obtainBrokerNodeIds(1);
+      if(test.test(nodeIds0,nodeIds1)) {
+         log.info("VALIDATION passed. {}", msg);
+      } else {
+         log.info("VALIDATION failed. {}", msg);
+         if (fullExit) {
+            throw new AssertionError(msg);
+         }
+      }
+      System.out.println("**********************************");
+
+      Thread.sleep(5_000);
+
    }
 }
